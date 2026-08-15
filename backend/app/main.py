@@ -6,8 +6,16 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-from sqlalchemy import create_engine, Column, String, Float, DateTime, Text
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    Float,
+    DateTime,
+    Text,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from .ml_engine import analyze_transaction
@@ -15,24 +23,38 @@ from .simulator import SimulationEngine
 
 
 # ============================================================
-# DATABASE
+# CONFIGURATION
 # ============================================================
+
+APP_NAME = "FinShield API"
+APP_VERSION = "1.0.0"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-if DATABASE_URL:
+# Render may provide postgres://
+if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
         "postgresql://",
-        1
+        1,
     )
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+if DATABASE_URL:
 
     engine = create_engine(
         DATABASE_URL,
-        pool_pre_ping=True
+        pool_pre_ping=True,
+        pool_recycle=300,
+        future=True,
     )
 
 else:
+
     DB_PATH = (
         Path(__file__).resolve().parent.parent
         / "finshield.db"
@@ -41,15 +63,16 @@ else:
     engine = create_engine(
         f"sqlite:///{DB_PATH}",
         connect_args={
-            "check_same_thread": False
-        }
+            "check_same_thread": False,
+        },
+        future=True,
     )
 
 
 SessionLocal = sessionmaker(
     bind=engine,
     autocommit=False,
-    autoflush=False
+    autoflush=False,
 )
 
 Base = declarative_base()
@@ -60,72 +83,116 @@ Base = declarative_base()
 # ============================================================
 
 class Transaction(Base):
+
     __tablename__ = "transactions"
 
-    id = Column(String, primary_key=True)
-    account_id = Column(String, index=True)
+    id = Column(
+        String,
+        primary_key=True,
+    )
+
+    account_id = Column(
+        String,
+        index=True,
+    )
+
     device_id = Column(String)
+
     merchant = Column(String)
+
     amount = Column(Float)
+
     location = Column(String)
+
     ip = Column(String)
+
     timestamp = Column(DateTime)
 
     risk_score = Column(Float)
+
     fraud_probability = Column(Float)
+
     anomaly_score = Column(Float)
+
     risk_level = Column(String)
+
     explanation = Column(Text)
 
 
 class Alert(Base):
+
     __tablename__ = "alerts"
 
-    id = Column(String, primary_key=True)
+    id = Column(
+        String,
+        primary_key=True,
+    )
+
     transaction_id = Column(String)
+
     account_id = Column(String)
+
     severity = Column(String)
+
     risk_score = Column(Float)
+
     title = Column(String)
+
     explanation = Column(Text)
-    status = Column(String, default="OPEN")
+
+    status = Column(
+        String,
+        default="OPEN",
+    )
+
     created_at = Column(DateTime)
 
 
-Base.metadata.create_all(engine)
+# Create tables
+Base.metadata.create_all(bind=engine)
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI APPLICATION
 # ============================================================
 
 app = FastAPI(
-    title="FinShield API",
-    version="1.0.0"
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="FinShield Fraud Intelligence API",
 )
 
 
 # ============================================================
-# CORS FIX
+# CORS
 # ============================================================
+
+# IMPORTANT:
+# allow_origins=["*"] + allow_credentials=False
+# solves Vercel -> Render OPTIONS/CORS problems.
+#
+# We are NOT using cookie authentication.
 
 app.add_middleware(
     CORSMiddleware,
 
-    # Allow all Vercel preview/production deployments
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origins=["*"],
 
-    # Local development
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:3000",
-    ],
-
-    # We are not using cookies/auth credentials
     allow_credentials=False,
 
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=[
+        "*",
+    ],
+
+    allow_headers=[
+        "*",
+    ],
+
+    expose_headers=[
+        "*",
+),
+
+    max_age=86400,
 )
 
 
@@ -136,10 +203,15 @@ app.add_middleware(
 class Hub:
 
     def __init__(self):
+
         self.clients = set()
+
         self.running = False
+
         self.task = None
+
         self.scenario = "coordinated_fraud"
+
         self.engine = SimulationEngine()
 
 
@@ -147,50 +219,167 @@ hub = Hub()
 
 
 # ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def get_db():
+
+    return SessionLocal()
+
+
+# ============================================================
 # SEED DATABASE
 # ============================================================
 
-def seed():
+def seed_database():
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
-        existing = db.query(Transaction).count()
+        existing_transactions = (
+            db.query(Transaction).count()
+        )
 
-        if existing > 0:
+        if existing_transactions > 0:
+
+            print(
+                f"FinShield database already contains "
+                f"{existing_transactions} transactions."
+            )
+
             return
+
+        print(
+            "FinShield database is empty. "
+            "Creating demo transactions..."
+        )
 
         now = datetime.utcnow()
 
         for i in range(80):
 
             tx = hub.engine.normal_transaction(
-                now - timedelta(minutes=80 - i)
+                now - timedelta(
+                    minutes=80 - i
+                )
             )
 
             result = analyze_transaction(
                 tx,
-                db
+                db,
             )
 
-            db.add(
-                Transaction(
-                    **result["transaction"]
-                )
+            transaction_data = result.get(
+                "transaction"
             )
+
+            if transaction_data:
+
+                db.add(
+                    Transaction(
+                        **transaction_data
+                    )
+                )
+
+            alert_data = result.get(
+                "alert"
+            )
+
+            if alert_data:
+
+                db.add(
+                    Alert(
+                        **alert_data
+                    )
+                )
 
         db.commit()
 
-    except Exception:
+        print(
+            "FinShield demo database seeded successfully."
+        )
+
+    except Exception as exc:
+
         db.rollback()
-        raise
+
+        print(
+            "Database seed error:",
+            repr(exc),
+        )
+
+        # Do not crash the whole API because seed failed.
+        # The application can still start.
 
     finally:
+
         db.close()
 
 
-seed()
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    print("=" * 60)
+    print("Starting FinShield API")
+    print("=" * 60)
+
+    try:
+
+        Base.metadata.create_all(
+            bind=engine
+        )
+
+        seed_database()
+
+    except Exception as exc:
+
+        print(
+            "Startup database error:",
+            repr(exc),
+        )
+
+    print(
+        "FinShield API startup complete."
+    )
+
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+@app.on_event("shutdown")
+async def shutdown_event():
+
+    print(
+        "FinShield API shutting down..."
+    )
+
+    hub.running = False
+
+    if hub.task:
+
+        if not hub.task.done():
+
+            hub.task.cancel()
+
+            try:
+
+                await hub.task
+
+            except asyncio.CancelledError:
+
+                pass
+
+        hub.task = None
+
+    print(
+        "FinShield API shutdown complete."
+    )
 
 
 # ============================================================
@@ -199,25 +388,34 @@ seed()
 
 async def broadcast(payload):
 
-    dead = []
+    dead_clients = []
 
-    for ws in list(hub.clients):
+    message = json.dumps(
+        payload,
+        default=str,
+    )
+
+    for websocket in list(
+        hub.clients
+    ):
 
         try:
 
-            await ws.send_text(
-                json.dumps(
-                    payload,
-                    default=str
-                )
+            await websocket.send_text(
+                message
             )
 
         except Exception:
 
-            dead.append(ws)
+            dead_clients.append(
+                websocket
+            )
 
-    for ws in dead:
-        hub.clients.discard(ws)
+    for websocket in dead_clients:
+
+        hub.clients.discard(
+            websocket
+        )
 
 
 # ============================================================
@@ -228,72 +426,100 @@ async def simulation_loop():
 
     hub.running = True
 
+    print(
+        f"Simulation started: {hub.scenario}"
+    )
+
     try:
 
         while hub.running:
 
+            # Generate transaction
             tx = hub.engine.next(
                 hub.scenario
             )
 
-            db = SessionLocal()
+            db = get_db()
 
             try:
 
+                # Analyze transaction
                 result = analyze_transaction(
                     tx,
-                    db
+                    db,
                 )
 
-                db.add(
-                    Transaction(
-                        **result["transaction"]
+                transaction_data = result.get(
+                    "transaction"
+                )
+
+                if transaction_data:
+
+                    db.add(
+                        Transaction(
+                            **transaction_data
+                        )
                     )
+
+                # Create fraud alert if required
+                alert_data = result.get(
+                    "alert"
                 )
 
-                if result.get("alert"):
+                if alert_data:
 
                     db.add(
                         Alert(
-                            **result["alert"]
+                            **alert_data
                         )
                     )
 
                 db.commit()
 
-            except Exception:
+            except Exception as exc:
 
                 db.rollback()
 
-                raise
+                print(
+                    "Simulation database error:",
+                    repr(exc),
+                )
 
             finally:
 
                 db.close()
 
+            # Send transaction to connected clients
             await broadcast(
                 {
                     "type": "transaction",
-                    "data": result
+                    "data": result,
                 }
             )
 
+            # 0.9 second stream interval
             await asyncio.sleep(0.9)
 
     except asyncio.CancelledError:
 
-        pass
+        print(
+            "Simulation task cancelled."
+        )
 
-    except Exception as e:
+    except Exception as exc:
 
         print(
             "Simulation error:",
-            repr(e)
+            repr(exc),
         )
 
     finally:
 
         hub.running = False
+
+        print(
+            "Simulation stopped."
+        )
 
 
 # ============================================================
@@ -301,15 +527,38 @@ async def simulation_loop():
 # ============================================================
 
 @app.get("/")
-def root():
+async def root():
 
     return {
-        "name": "FinShield API",
+        "name": APP_NAME,
         "status": "online",
-        "version": "1.0.0",
+        "version": APP_VERSION,
+        "message": "FinShield Fraud Intelligence API is running.",
         "docs": "/docs",
-        "health": "/api/health"
+        "redoc": "/redoc",
+        "health": "/api/health",
+        "endpoints": {
+            "dashboard": "/api/dashboard/summary",
+            "transactions": "/api/transactions",
+            "alerts": "/api/fraud/alerts",
+            "graph": "/api/graph",
+            "simulation": "/api/simulation/status",
+            "websocket": "/ws/transactions",
+        },
     }
+
+
+# ============================================================
+# HEAD ROOT
+# ============================================================
+
+@app.head("/")
+async def root_head():
+
+    return JSONResponse(
+        content=None,
+        status_code=200,
+    )
 
 
 # ============================================================
@@ -317,32 +566,45 @@ def root():
 # ============================================================
 
 @app.get("/api/health")
-def health():
+async def health():
 
-    # Test database connection too
     database_status = "online"
 
-    db = SessionLocal()
+    db = None
 
     try:
-        db.query(Transaction).limit(1).all()
 
-    except Exception as e:
+        db = get_db()
+
+        db.query(
+            Transaction
+        ).limit(1).all()
+
+    except Exception as exc:
 
         database_status = "offline"
 
         print(
             "Database health error:",
-            repr(e)
+            repr(exc),
         )
 
     finally:
-        db.close()
+
+        if db:
+
+            db.close()
 
     return {
-        "status": "operational"
-        if database_status == "online"
-        else "degraded",
+        "status": (
+            "operational"
+            if database_status == "online"
+            else "degraded"
+        ),
+
+        "service": APP_NAME,
+
+        "version": APP_VERSION,
 
         "services": {
             "api": "online",
@@ -352,8 +614,10 @@ def health():
                 "online"
                 if hub.running
                 else "standby"
-            )
-        }
+            ),
+        },
+
+        "timestamp": datetime.utcnow().isoformat(),
     }
 
 
@@ -362,52 +626,78 @@ def health():
 # ============================================================
 
 @app.get("/api/dashboard/summary")
-def summary():
+async def dashboard_summary():
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
-        total = db.query(
-            Transaction
-        ).count()
-
-        alerts = db.query(
-            Alert
-        ).count()
-
-        transactions = db.query(
-            Transaction
-        ).all()
-
-        avg = (
-            sum(
-                (x.risk_score or 0)
-                for x in transactions
-            )
-            / max(total, 1)
+        total = (
+            db.query(
+                Transaction
+            ).count()
         )
 
-        critical = db.query(
-            Transaction
-        ).filter(
-            Transaction.risk_score >= 75
-        ).count()
+        alerts_count = (
+            db.query(
+                Alert
+            ).count()
+        )
 
-        suspicious = db.query(
-            Transaction
-        ).filter(
-            Transaction.risk_score >= 50,
-            Transaction.risk_score < 75
-        ).count()
+        transactions = (
+            db.query(
+                Transaction
+            ).all()
+        )
+
+        if transactions:
+
+            average_risk = (
+                sum(
+                    (
+                        tx.risk_score
+                        or 0
+                    )
+                    for tx in transactions
+                )
+                / len(transactions)
+            )
+
+        else:
+
+            average_risk = 0
+
+        critical = (
+            db.query(
+                Transaction
+            )
+            .filter(
+                Transaction.risk_score >= 75
+            )
+            .count()
+        )
+
+        suspicious = (
+            db.query(
+                Transaction
+            )
+            .filter(
+                Transaction.risk_score >= 50,
+                Transaction.risk_score < 75,
+            )
+            .count()
+        )
 
         return {
             "transactions": total,
-            "alerts": alerts,
-            "average_risk": round(avg, 1),
+            "alerts": alerts_count,
+            "average_risk": round(
+                average_risk,
+                1,
+            ),
             "critical": critical,
             "suspicious": suspicious,
-            "transactions_per_minute": 68
+            "transactions_per_minute": 68,
         }
 
     finally:
@@ -420,19 +710,26 @@ def summary():
 # ============================================================
 
 @app.get("/api/transactions")
-def transactions(limit: int = 80):
+async def get_transactions(
+    limit: int = 80,
+):
 
     limit = max(
         1,
-        min(limit, 500)
+        min(
+            limit,
+            500,
+        ),
     )
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
         rows = (
-            db.query(Transaction)
+            db.query(
+                Transaction
+            )
             .order_by(
                 Transaction.timestamp.desc()
             )
@@ -442,11 +739,12 @@ def transactions(limit: int = 80):
 
         return [
             {
-                c.name: getattr(
+                column.name: getattr(
                     row,
-                    c.name
+                    column.name,
                 )
-                for c in Transaction.__table__.columns
+                for column
+                in Transaction.__table__.columns
             }
             for row in rows
         ]
@@ -460,31 +758,36 @@ def transactions(limit: int = 80):
 # SINGLE TRANSACTION
 # ============================================================
 
-@app.get("/api/transactions/{tx_id}")
-def transaction(tx_id: str):
+@app.get(
+    "/api/transactions/{tx_id}"
+)
+async def get_transaction(
+    tx_id: str,
+):
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
         row = db.get(
             Transaction,
-            tx_id
+            tx_id,
         )
 
         if not row:
 
             raise HTTPException(
                 status_code=404,
-                detail="Transaction not found"
+                detail="Transaction not found",
             )
 
         return {
-            c.name: getattr(
+            column.name: getattr(
                 row,
-                c.name
+                column.name,
             )
-            for c in Transaction.__table__.columns
+            for column
+            in Transaction.__table__.columns
         }
 
     finally:
@@ -497,14 +800,16 @@ def transaction(tx_id: str):
 # ============================================================
 
 @app.get("/api/fraud/alerts")
-def alerts():
+async def get_alerts():
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
         rows = (
-            db.query(Alert)
+            db.query(
+                Alert
+            )
             .order_by(
                 Alert.created_at.desc()
             )
@@ -514,11 +819,12 @@ def alerts():
 
         return [
             {
-                c.name: getattr(
+                column.name: getattr(
                     row,
-                    c.name
+                    column.name,
                 )
-                for c in Alert.__table__.columns
+                for column
+                in Alert.__table__.columns
             }
             for row in rows
         ]
@@ -532,41 +838,84 @@ def alerts():
 # UPDATE ALERT STATUS
 # ============================================================
 
-@app.post("/api/fraud/alerts/{alert_id}/status")
-def alert_status(
+@app.post(
+    "/api/fraud/alerts/{alert_id}/status"
+)
+async def update_alert_status(
     alert_id: str,
-    status: str
+    status: str,
 ):
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
         row = db.get(
             Alert,
-            alert_id
+            alert_id,
         )
 
         if not row:
 
             raise HTTPException(
                 status_code=404,
-                detail="Alert not found"
+                detail="Alert not found",
             )
 
-        row.status = status.upper()
+        allowed_statuses = {
+            "OPEN",
+            "INVESTIGATING",
+            "RESOLVED",
+            "DISMISSED",
+            "CLOSED",
+        }
+
+        new_status = status.upper()
+
+        if new_status not in allowed_statuses:
+
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Invalid status. "
+                    "Allowed values: "
+                    + ", ".join(
+                        sorted(
+                            allowed_statuses
+                        )
+                    )
+                ),
+            )
+
+        row.status = new_status
 
         db.commit()
 
         return {
             "ok": True,
-            "status": row.status
+            "alert_id": alert_id,
+            "status": row.status,
         }
 
-    except Exception:
+    except HTTPException:
 
         db.rollback()
+
         raise
+
+    except Exception as exc:
+
+        db.rollback()
+
+        print(
+            "Alert update error:",
+            repr(exc),
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update alert status",
+        )
 
     finally:
 
@@ -578,14 +927,16 @@ def alert_status(
 # ============================================================
 
 @app.get("/api/graph")
-def graph():
+async def fraud_graph():
 
-    db = SessionLocal()
+    db = get_db()
 
     try:
 
         rows = (
-            db.query(Transaction)
+            db.query(
+                Transaction
+            )
             .filter(
                 Transaction.risk_score >= 50
             )
@@ -597,7 +948,10 @@ def graph():
         )
 
         nodes = {}
+
         edges = []
+
+        edge_keys = set()
 
         for row in rows:
 
@@ -605,56 +959,94 @@ def graph():
                 (
                     row.account_id,
                     "account",
-                    row.account_id
+                    row.account_id,
                 ),
                 (
                     row.device_id,
                     "device",
-                    row.device_id
+                    row.device_id,
                 ),
                 (
                     row.merchant,
                     "merchant",
-                    row.merchant
-                )
+                    row.merchant,
+                ),
             ]
 
-            for key, node_type, label in entities:
+            for (
+                node_id,
+                node_type,
+                label,
+            ) in entities:
 
-                if key:
+                if node_id:
 
                     nodes.setdefault(
-                        key,
+                        node_id,
                         {
-                            "id": key,
+                            "id": node_id,
                             "type": node_type,
-                            "label": label
+                            "label": label,
+                        },
+                    )
+
+            # Account -> Device
+            if (
+                row.account_id
+                and row.device_id
+            ):
+
+                edge_key = (
+                    row.account_id,
+                    row.device_id,
+                    "uses",
+                )
+
+                if edge_key not in edge_keys:
+
+                    edges.append(
+                        {
+                            "source": row.account_id,
+                            "target": row.device_id,
+                            "label": "uses",
                         }
                     )
 
-            if row.account_id and row.device_id:
+                    edge_keys.add(
+                        edge_key
+                    )
 
-                edges.append(
-                    {
-                        "source": row.account_id,
-                        "target": row.device_id,
-                        "label": "uses"
-                    }
+            # Account -> Merchant
+            if (
+                row.account_id
+                and row.merchant
+            ):
+
+                edge_key = (
+                    row.account_id,
+                    row.merchant,
+                    "pays",
                 )
 
-            if row.account_id and row.merchant:
+                if edge_key not in edge_keys:
 
-                edges.append(
-                    {
-                        "source": row.account_id,
-                        "target": row.merchant,
-                        "label": "pays"
-                    }
-                )
+                    edges.append(
+                        {
+                            "source": row.account_id,
+                            "target": row.merchant,
+                            "label": "pays",
+                        }
+                    )
+
+                    edge_keys.add(
+                        edge_key
+                    )
 
         return {
-            "nodes": list(nodes.values()),
-            "edges": edges
+            "nodes": list(
+                nodes.values()
+            ),
+            "edges": edges,
         }
 
     finally:
@@ -666,12 +1058,14 @@ def graph():
 # SIMULATION STATUS
 # ============================================================
 
-@app.get("/api/simulation/status")
-def sim_status():
+@app.get(
+    "/api/simulation/status"
+)
+async def simulation_status():
 
     return {
         "running": hub.running,
-        "scenario": hub.scenario
+        "scenario": hub.scenario,
     }
 
 
@@ -679,19 +1073,28 @@ def sim_status():
 # START SIMULATION
 # ============================================================
 
-@app.post("/api/simulation/start")
+@app.post(
+    "/api/simulation/start"
+)
 async def start_simulation(
-    scenario: str = "coordinated_fraud"
+    scenario: str = "coordinated_fraud",
 ):
 
     if hub.running:
 
         return {
             "running": True,
-            "scenario": hub.scenario
+            "scenario": hub.scenario,
+            "message": "Simulation already running.",
         }
 
-    hub.scenario = scenario
+    if not scenario.strip():
+
+        scenario = "coordinated_fraud"
+
+    hub.scenario = scenario.strip()
+
+    hub.running = True
 
     hub.task = asyncio.create_task(
         simulation_loop()
@@ -699,7 +1102,8 @@ async def start_simulation(
 
     return {
         "running": True,
-        "scenario": scenario
+        "scenario": hub.scenario,
+        "message": "Simulation started.",
     }
 
 
@@ -707,14 +1111,17 @@ async def start_simulation(
 # STOP SIMULATION
 # ============================================================
 
-@app.post("/api/simulation/stop")
+@app.post(
+    "/api/simulation/stop"
+)
 async def stop_simulation():
 
     hub.running = False
 
     return {
         "running": False,
-        "scenario": hub.scenario
+        "scenario": hub.scenario,
+        "message": "Simulation stopping.",
     }
 
 
@@ -722,25 +1129,81 @@ async def stop_simulation():
 # WEBSOCKET
 # ============================================================
 
-@app.websocket("/ws/transactions")
-async def ws_transactions(
-    websocket: WebSocket
+@app.websocket(
+    "/ws/transactions"
+)
+async def websocket_transactions(
+    websocket: WebSocket,
 ):
 
     await websocket.accept()
 
-    hub.clients.add(websocket)
+    hub.clients.add(
+        websocket
+    )
 
     try:
 
+        # Immediately tell frontend connection succeeded
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "connection",
+                    "status": "connected",
+                    "message": (
+                        "FinShield transaction "
+                        "stream connected."
+                    ),
+                }
+            )
+        )
+
         while True:
 
+            # Keep connection alive.
+            # Frontend can send ping messages.
             await websocket.receive_text()
 
     except WebSocketDisconnect:
 
-        hub.clients.discard(websocket)
+        hub.clients.discard(
+            websocket
+        )
 
-    except Exception:
+    except Exception as exc:
 
-        hub.clients.discard(websocket)
+        print(
+            "WebSocket error:",
+            repr(exc),
+        )
+
+        hub.clients.discard(
+            websocket
+        )
+
+
+# ============================================================
+# GLOBAL EXCEPTION HANDLER
+# ============================================================
+
+@app.exception_handler(Exception)
+async def global_exception_handler(
+    request,
+    exc,
+):
+
+    print(
+        "Unhandled API error:",
+        repr(exc),
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "message": (
+                "FinShield API encountered "
+                "an unexpected error."
+            ),
+        },
+    )
