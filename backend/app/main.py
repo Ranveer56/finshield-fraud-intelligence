@@ -8,14 +8,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from sqlalchemy import (
-    create_engine,
-    Column,
-    String,
-    Float,
-    DateTime,
-    Text,
-)
+from sqlalchemy import create_engine, Column, String, Float, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from .ml_engine import analyze_transaction
@@ -23,28 +16,25 @@ from .simulator import SimulationEngine
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIG
 # ============================================================
 
 APP_NAME = "FinShield API"
 APP_VERSION = "1.0.0"
 
+
+# ============================================================
+# DATABASE CONFIGURATION
+# ============================================================
+
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Render may provide postgres://
-if DATABASE_URL.startswith("postgres://"):
+if DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace(
         "postgres://",
         "postgresql://",
         1,
     )
-
-
-# ============================================================
-# DATABASE
-# ============================================================
-
-if DATABASE_URL:
 
     engine = create_engine(
         DATABASE_URL,
@@ -54,7 +44,6 @@ if DATABASE_URL:
     )
 
 else:
-
     DB_PATH = (
         Path(__file__).resolve().parent.parent
         / "finshield.db"
@@ -63,7 +52,7 @@ else:
     engine = create_engine(
         f"sqlite:///{DB_PATH}",
         connect_args={
-            "check_same_thread": False,
+            "check_same_thread": False
         },
         future=True,
     )
@@ -148,12 +137,17 @@ class Alert(Base):
     created_at = Column(DateTime)
 
 
-# Create tables
-Base.metadata.create_all(bind=engine)
+# ============================================================
+# CREATE DATABASE TABLES
+# ============================================================
+
+Base.metadata.create_all(
+    bind=engine
+)
 
 
 # ============================================================
-# FASTAPI APPLICATION
+# FASTAPI APP
 # ============================================================
 
 app = FastAPI(
@@ -167,31 +161,21 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-# IMPORTANT:
-# allow_origins=["*"] + allow_credentials=False
-# solves Vercel -> Render OPTIONS/CORS problems.
+# This allows:
+# - Vercel production
+# - Vercel preview
+# - localhost development
+# - Render testing
 #
-# We are NOT using cookie authentication.
+# No cookies/auth credentials are being used.
 
 app.add_middleware(
     CORSMiddleware,
-
     allow_origins=["*"],
-
     allow_credentials=False,
-
-    allow_methods=[
-        "*",
-    ],
-
-    allow_headers=[
-        "*",
-    ],
-
-    expose_headers=[
-        "*",
-),
-
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
     max_age=86400,
 )
 
@@ -219,7 +203,7 @@ hub = Hub()
 
 
 # ============================================================
-# DATABASE HELPERS
+# DATABASE HELPER
 # ============================================================
 
 def get_db():
@@ -228,7 +212,7 @@ def get_db():
 
 
 # ============================================================
-# SEED DATABASE
+# DATABASE SEED
 # ============================================================
 
 def seed_database():
@@ -237,22 +221,21 @@ def seed_database():
 
     try:
 
-        existing_transactions = (
+        existing = (
             db.query(Transaction).count()
         )
 
-        if existing_transactions > 0:
+        if existing > 0:
 
             print(
-                f"FinShield database already contains "
-                f"{existing_transactions} transactions."
+                f"Database already contains "
+                f"{existing} transactions."
             )
 
             return
 
         print(
-            "FinShield database is empty. "
-            "Creating demo transactions..."
+            "Creating FinShield demo data..."
         )
 
         now = datetime.utcnow()
@@ -297,7 +280,7 @@ def seed_database():
         db.commit()
 
         print(
-            "FinShield demo database seeded successfully."
+            "Demo data created successfully."
         )
 
     except Exception as exc:
@@ -308,9 +291,6 @@ def seed_database():
             "Database seed error:",
             repr(exc),
         )
-
-        # Do not crash the whole API because seed failed.
-        # The application can still start.
 
     finally:
 
@@ -325,7 +305,7 @@ def seed_database():
 async def startup_event():
 
     print("=" * 60)
-    print("Starting FinShield API")
+    print("FINSHIELD API STARTING")
     print("=" * 60)
 
     try:
@@ -339,12 +319,12 @@ async def startup_event():
     except Exception as exc:
 
         print(
-            "Startup database error:",
+            "Startup error:",
             repr(exc),
         )
 
     print(
-        "FinShield API startup complete."
+        "FinShield API started successfully."
     )
 
 
@@ -361,7 +341,7 @@ async def shutdown_event():
 
     hub.running = False
 
-    if hub.task:
+    if hub.task is not None:
 
         if not hub.task.done():
 
@@ -383,7 +363,7 @@ async def shutdown_event():
 
 
 # ============================================================
-# WEBSOCKET BROADCAST
+# BROADCAST
 # ============================================================
 
 async def broadcast(payload):
@@ -427,23 +407,24 @@ async def simulation_loop():
     hub.running = True
 
     print(
-        f"Simulation started: {hub.scenario}"
+        f"Simulation started: "
+        f"{hub.scenario}"
     )
 
     try:
 
         while hub.running:
 
-            # Generate transaction
             tx = hub.engine.next(
                 hub.scenario
             )
 
             db = get_db()
 
+            result = None
+
             try:
 
-                # Analyze transaction
                 result = analyze_transaction(
                     tx,
                     db,
@@ -461,7 +442,6 @@ async def simulation_loop():
                         )
                     )
 
-                # Create fraud alert if required
                 alert_data = result.get(
                     "alert"
                 )
@@ -489,21 +469,21 @@ async def simulation_loop():
 
                 db.close()
 
-            # Send transaction to connected clients
-            await broadcast(
-                {
-                    "type": "transaction",
-                    "data": result,
-                }
-            )
+            if result is not None:
 
-            # 0.9 second stream interval
+                await broadcast(
+                    {
+                        "type": "transaction",
+                        "data": result,
+                    }
+                )
+
             await asyncio.sleep(0.9)
 
     except asyncio.CancelledError:
 
         print(
-            "Simulation task cancelled."
+            "Simulation cancelled."
         )
 
     except Exception as exc:
@@ -533,7 +513,10 @@ async def root():
         "name": APP_NAME,
         "status": "online",
         "version": APP_VERSION,
-        "message": "FinShield Fraud Intelligence API is running.",
+        "message": (
+            "FinShield Fraud Intelligence "
+            "API is running."
+        ),
         "docs": "/docs",
         "redoc": "/redoc",
         "health": "/api/health",
@@ -549,7 +532,7 @@ async def root():
 
 
 # ============================================================
-# HEAD ROOT
+# ROOT HEAD
 # ============================================================
 
 @app.head("/")
@@ -591,7 +574,7 @@ async def health():
 
     finally:
 
-        if db:
+        if db is not None:
 
             db.close()
 
@@ -601,11 +584,8 @@ async def health():
             if database_status == "online"
             else "degraded"
         ),
-
         "service": APP_NAME,
-
         "version": APP_VERSION,
-
         "services": {
             "api": "online",
             "database": database_status,
@@ -616,7 +596,6 @@ async def health():
                 else "standby"
             ),
         },
-
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -774,7 +753,7 @@ async def get_transaction(
             tx_id,
         )
 
-        if not row:
+        if row is None:
 
             raise HTTPException(
                 status_code=404,
@@ -855,7 +834,7 @@ async def update_alert_status(
             alert_id,
         )
 
-        if not row:
+        if row is None:
 
             raise HTTPException(
                 status_code=404,
@@ -870,7 +849,7 @@ async def update_alert_status(
             "CLOSED",
         }
 
-        new_status = status.upper()
+        new_status = status.upper().strip()
 
         if new_status not in allowed_statuses:
 
@@ -908,7 +887,7 @@ async def update_alert_status(
         db.rollback()
 
         print(
-            "Alert update error:",
+            "Alert status error:",
             repr(exc),
         )
 
@@ -990,7 +969,6 @@ async def fraud_graph():
                         },
                     )
 
-            # Account -> Device
             if (
                 row.account_id
                 and row.device_id
@@ -1016,7 +994,6 @@ async def fraud_graph():
                         edge_key
                     )
 
-            # Account -> Merchant
             if (
                 row.account_id
                 and row.merchant
@@ -1085,14 +1062,18 @@ async def start_simulation(
         return {
             "running": True,
             "scenario": hub.scenario,
-            "message": "Simulation already running.",
+            "message": (
+                "Simulation is already running."
+            ),
         }
 
-    if not scenario.strip():
+    scenario = scenario.strip()
+
+    if not scenario:
 
         scenario = "coordinated_fraud"
 
-    hub.scenario = scenario.strip()
+    hub.scenario = scenario
 
     hub.running = True
 
@@ -1144,7 +1125,6 @@ async def websocket_transactions(
 
     try:
 
-        # Immediately tell frontend connection succeeded
         await websocket.send_text(
             json.dumps(
                 {
@@ -1160,8 +1140,6 @@ async def websocket_transactions(
 
         while True:
 
-            # Keep connection alive.
-            # Frontend can send ping messages.
             await websocket.receive_text()
 
     except WebSocketDisconnect:
@@ -1183,7 +1161,7 @@ async def websocket_transactions(
 
 
 # ============================================================
-# GLOBAL EXCEPTION HANDLER
+# GLOBAL ERROR HANDLER
 # ============================================================
 
 @app.exception_handler(Exception)
